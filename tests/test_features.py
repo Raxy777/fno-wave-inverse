@@ -40,8 +40,8 @@ def test_per_sample_relative_errors_reduce_one_batch_correctly():
     target = pred + 1.0
     recv = torch.tensor([[0, 0], [1, 2], [3, 3]])
     field, ring = training.per_sample_relative_errors(pred, target, recv)
-    expected_field = ((pred - target).pow(2).sum((1, 2, 3)).sqrt()
-                      / target.pow(2).sum((1, 2, 3)).sqrt())
+    expected_field = ((pred - target).pow(2).sum((1, 2, 3, 4)).sqrt()
+                      / target.pow(2).sum((1, 2, 3, 4)).sqrt())
     pr, tr = pred[..., recv[:, 0], recv[:, 1]], target[..., recv[:, 0], recv[:, 1]]
     expected_ring = ((pr - tr).pow(2).sum((1, 2, 3)).sqrt()
                      / tr.pow(2).sum((1, 2, 3)).sqrt())

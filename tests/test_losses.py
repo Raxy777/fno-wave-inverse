@@ -765,6 +765,8 @@ def test_measurement_loss_subset_is_reproducible_and_in_range():
         losses.measurement_loss(t[..., :16, :16], t[..., :16, :16], recv)
     with pytest.raises(IndexError, match="different grids"):
         losses.measurement_loss(p, t, torch.tensor([[0, 0], [-1, 3]]))
+    with pytest.raises(ValueError, match="n_subset must be positive"):
+        losses.measurement_loss(p, t, recv, n_subset=0)
 
 
 # ---------------------------------------------------------------------------

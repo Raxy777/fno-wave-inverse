@@ -74,13 +74,14 @@ def per_sample_relative_errors(pred: Tensor, target: Tensor, recv: Tensor, *,
     Keeping this reduction here, rather than duplicating it in a notebook, prevents a
     stale dimension tuple from silently turning a per-sample metric into a scalar.
     """
-    dims = (1, 2, 3)
+    dims = (1, 2, 3, 4)
     field = ((pred - target).pow(2).sum(dims).sqrt()
              / target.pow(2).sum(dims).sqrt().clamp_min(eps))
     ry, rx = recv[:, 0], recv[:, 1]
     p_ring, t_ring = pred[..., ry, rx], target[..., ry, rx]
-    ring = ((p_ring - t_ring).pow(2).sum(dims).sqrt()
-            / t_ring.pow(2).sum(dims).sqrt().clamp_min(eps))
+    ring_dims = (1, 2, 3)
+    ring = ((p_ring - t_ring).pow(2).sum(ring_dims).sqrt()
+            / t_ring.pow(2).sum(ring_dims).sqrt().clamp_min(eps))
     return field, ring
 
 
@@ -175,7 +176,7 @@ def train(model: FNO2d, train_path: str, val_path: str, *, out_dir: str,
           weight_decay: float = cfg.WEIGHT_DECAY, grad_clip: float = cfg.GRAD_CLIP,
           gamma: float = cfg.GAMMA_H1, beta: float = cfg.BETA_MEAS,
           alpha: float | None = cfg.ALPHA_PHYS, balance_every: int = 200,
-          n_meas: int = 8, num_workers: int = 4, seed: int = cfg.SEED,
+          n_meas: int = cfg.N_RECV_SUBSET, num_workers: int = 4, seed: int = cfg.SEED,
           log_every: int = 50, progress=None, resume_from: str | None = None) -> dict:
     """
     Train and checkpoint.  `alpha=None` disables the physics term entirely, which is
@@ -194,6 +195,8 @@ def train(model: FNO2d, train_path: str, val_path: str, *, out_dir: str,
     not to reproduce one.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if not 1 <= n_meas <= cfg.N_RECV:
+        raise ValueError(f"n_meas must be in [1, {cfg.N_RECV}]; got {n_meas}")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
@@ -206,7 +209,10 @@ def train(model: FNO2d, train_path: str, val_path: str, *, out_dir: str,
 
     model = model.to(device)
 
-    hist: dict = dict(train=[], val=[], alpha=[], lr=[], config=config_snapshot())
+    hist: dict = dict(train=[], val=[], alpha=[], lr=[], config=config_snapshot(),
+                      training=dict(beta_meas=beta, gamma_h1=gamma,
+                                    n_receivers_per_step=min(n_meas, cfg.N_RECV),
+                                    seed=seed, batch_size=batch_size))
     best = math.inf
     start_epoch = 0
     lr_start = lr
@@ -221,6 +227,16 @@ def train(model: FNO2d, train_path: str, val_path: str, *, out_dir: str,
             hist = json.loads(hp.read_text())
             for k in ("train", "val", "alpha", "lr"):
                 hist.setdefault(k, [])
+            previous_training = hist.get("training", {})
+            previous_beta = previous_training.get("beta_meas")
+            if previous_beta is not None and float(previous_beta) != float(beta):
+                raise ValueError(
+                    f"cannot resume with beta={beta}; history used beta_meas={previous_beta}. "
+                    "Use a new output directory for a different loss weight.")
+            hist.setdefault("training", dict(
+                beta_meas=beta, gamma_h1=gamma,
+                n_receivers_per_step=min(n_meas, cfg.N_RECV),
+                seed=seed, batch_size=batch_size))
             if hist["val"]:
                 best = min(r["rel_l2"] for r in hist["val"])   # don't clobber best.pt
             if hist["lr"]:
@@ -378,6 +394,10 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=cfg.EPOCHS)
     ap.add_argument("--no-physics", action="store_true",
                     help="ablation: drop L_phys (§11.2 step 8)")
+    ap.add_argument("--beta-meas", type=float, default=cfg.BETA_MEAS,
+                    help="weight for the receiver-ring measurement loss")
+    ap.add_argument("--n-meas", type=int, default=cfg.N_RECV_SUBSET,
+                    help="receivers sampled per step (default: all receivers)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--resume", default=None,
                     help="warm-start from this checkpoint (e.g. .../last.pt)")
@@ -391,7 +411,9 @@ def main() -> None:
         prog = None
     train(model, f"{a.data}/train.h5", f"{a.data}/val.h5", out_dir=a.out,
           epochs=a.epochs, alpha=None if a.no_physics else cfg.ALPHA_PHYS,
-          num_workers=a.workers, progress=prog, resume_from=a.resume)
+          beta=a.beta_meas, n_meas=a.n_meas,
+          num_workers=a.workers, progress=prog,
+          resume_from=a.resume)
 
 
 if __name__ == "__main__":

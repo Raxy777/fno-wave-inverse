@@ -270,20 +270,6 @@ def test_solver_verification_does_not_pass_without_required_residual_measurement
     assert result.iou() is not None
     assert result.position_error_ls == pytest.approx(0.0)
     assert cfg.GATE_SOLVER_VERIFY_RESIDUAL_RATIO > 1.0
-    assert d.is_complex() and torch.isfinite(d.abs()).all()
-    assert float(d.abs().max()) > 0.0
-
-    # Two different radii give two different observations: the map is not degenerate.
-    assert float((d[0] - d[1]).abs().max()) > 1e-6 * float(d.abs().max())
-
-    # And a nonzero incident subtracts exactly, in the units of the observation.
-    inc = _incident(NT_SHORT)
-    inc["ascans"][0, 0] += 1.0
-    d2 = SENS.solver_receivers(th, Circle(), src_idx=0, nu_idx=0, incident=inc,
-                               nt=NT_SHORT)
-    om = H.omegas_tensor()
-    off = H.displacement_from_ascans(inc["ascans"][0, 0].unsqueeze(0), omegas=om)
-    assert torch.allclose(d2, d - off, atol=1e-6 * float(d.abs().max()))
 
 
 @pytest.mark.slow

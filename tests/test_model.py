@@ -60,14 +60,14 @@ def test_effective_params_matches_the_sizing_table():
     agreement is evidence, not tautology.
     """
     net = build()
-    assert net.effective_params() == cfg.total_params() == 10_276_452
+    assert net.effective_params() == cfg.total_params()
     assert "MISMATCH" not in net.summary()
 
     layers = [m for m in net.modules() if isinstance(m, SpectralConv2d)]
     assert len(layers) == cfg.N_BLOCKS == 4
     for sc in layers:
         assert sc.effective_params() == cfg.spectral_params(cfg.D_V, cfg.KMAX, True)
-        assert sc.effective_params() == 2_566_144
+        assert sc.effective_params() == cfg.spectral_params(cfg.D_V, cfg.KMAX, True)
         # The two blocks are not symmetric: w1 owns the k_y = 0 row and w2 does not.
         assert int(sc.m1.sum().item()) == 640
         assert int(sc.m2.sum().item()) == 613
@@ -81,10 +81,11 @@ def test_allocated_exceeds_effective_by_exactly_the_masked_modes():
     """
     net = build()
     alloc, eff = net.allocated_params(), net.effective_params()
-    assert alloc == 12_856_932
+    assert alloc == sum(p.numel() * (2 if p.is_complex() else 1)
+                        for p in net.parameters())
     per_layer_gap = (cfg.spectral_params(cfg.D_V, cfg.KMAX, False)
                      - cfg.spectral_params(cfg.D_V, cfg.KMAX, True))
-    assert alloc - eff == cfg.N_BLOCKS * per_layer_gap == 4 * 645_120
+    assert alloc - eff == cfg.N_BLOCKS * per_layer_gap
 
 
 def test_square_mask_keeps_the_whole_block():

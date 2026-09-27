@@ -352,7 +352,7 @@ N_RECV_PER_SIDE: int = 8
 N_SRC: int = 8                 # 2 per side
 N_SRC_PER_SIDE: int = 2
 RING_INSET_NET: int = 3        # cells inside the cropped edge
-N_RECV_SUBSET: int = 8         # random 8-of-32 per training step (§7.3)
+N_RECV_SUBSET: int = N_RECV    # use all receivers for a lower-variance measurement gradient
 
 # Source-cell exclusion radius for the physics residual (see README).
 PHYS_SOURCE_EXCLUDE_CELLS: float = 3.0
@@ -562,7 +562,7 @@ LOF_MODEL_FLOOR: float = GATE_REL_L2 ** 2
 # ---------------------------------------------------------------------------
 C_IN: int = 12
 C_OUT: int = 4
-D_V: int = 32
+D_V: int = 64
 N_BLOCKS: int = 4
 LIFT_HIDDEN: int = 64
 PROJ_HIDDEN: int = 128
@@ -577,7 +577,7 @@ GRAD_CLIP: float = 1.0
 # The network is time-harmonic: frequency enters as a conditioning channel, so one
 # stored sample (geometry, source, nu) yields M_FREQ = 20 distinct training
 # examples.  Using all 20 with BATCH_SIZE = 16 would put 320 fields through the
-# network at once -- at d_v = 32 and 128^2 that is ~0.67 GB per stored activation
+# network at once -- at d_v = 64 and 128^2 that is ~1.34 GB per stored activation
 # and several GB once the complex spectral intermediates are counted.  Drawing a
 # random subset per sample per step keeps the effective batch at
 # BATCH_SIZE * N_FREQ_PER_SAMPLE = 64 while still seeing every frequency many
@@ -610,7 +610,7 @@ ERODE_CELLS: int = STENCIL_HALF_WIDTH + 1   # §7.2: stencil half-width + 1
 
 # Capacity sweep variants (§6.4)
 VARIANTS = {
-    "primary": dict(d_v=32, kmax=28),
+    "primary": dict(d_v=64, kmax=28),
     "small": dict(d_v=24, kmax=24),
     "tiny": dict(d_v=16, kmax=16),
 }

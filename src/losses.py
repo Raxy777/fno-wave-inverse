@@ -21,13 +21,11 @@ gradient amplifies the high-wavenumber part of the error by roughly k dx ~ 0.4-0
 and matching the two terms' natural scales rather than their nominal weights is what
 keeps L_field in charge.
 
-`L_meas` is the error at the 32 receivers, which is what the inversion actually
-reads.  32 pixels out of 16384 would otherwise contribute 0.2% of L_field and be
-effectively unconstrained, and a surrogate that is excellent in the field interior
-and mediocre on the measurement ring is useless for the inverse problem.  A random
-subset of 8 of the 32 is used each step rather than all 32: the estimator is
-unbiased either way, and subsetting stops the ring from becoming a set of 32
-memorised values.
+`L_meas` is the relative error at the 32 receivers, which is what the inversion
+actually reads. It is reduced and normalized independently from the field loss, so
+the small number of receiver pixels does not dilute it by a factor of 32/16384.
+Training uses all 32 receivers by default to reduce gradient variance; callers can
+request a random subset for a controlled compute/variance tradeoff.
 
 `L_phys` is the residual of the governing equation itself, evaluated on the predicted
 *total* field.  Two things are excluded from it, both for real reasons rather than
@@ -122,7 +120,8 @@ def h1_seminorm(pred: Tensor, target: Tensor, *, dx: float = cfg.DX_NET,
 
 
 def measurement_loss(pred: Tensor, target: Tensor, recv_yx: Tensor, *,
-                     n_subset: int = 8, generator: torch.Generator | None = None,
+                     n_subset: int = cfg.N_RECV_SUBSET,
+                     generator: torch.Generator | None = None,
                      eps: float = 1e-12) -> tuple[Tensor, Tensor]:
     """
     Relative error at a random subset of receivers.  Returns (loss, chosen indices).
@@ -138,6 +137,8 @@ def measurement_loss(pred: Tensor, target: Tensor, recv_yx: Tensor, *,
     """
     if recv_yx.dim() != 2 or recv_yx.shape[1] != 2:
         raise ValueError(f"recv_yx must be [R, 2]; got {tuple(recv_yx.shape)}")
+    if n_subset < 1:
+        raise ValueError(f"n_subset must be positive; got {n_subset}")
     ny, nx = pred.shape[-2], pred.shape[-1]
     lo = int(recv_yx.min()) if recv_yx.numel() else 0
     hi_y, hi_x = int(recv_yx[:, 0].max()), int(recv_yx[:, 1].max())
@@ -378,7 +379,7 @@ class LossTerms:
 def compute(pred: Tensor, target: Tensor, *, recv_yx: Tensor,
             ctx: PhysicsContext | None = None, u_inc: Tensor | None = None,
             alpha: float = cfg.ALPHA_PHYS, beta: float = cfg.BETA_MEAS,
-            gamma: float = cfg.GAMMA_H1, n_meas: int = 8,
+            gamma: float = cfg.GAMMA_H1, n_meas: int = cfg.N_RECV_SUBSET,
             generator: torch.Generator | None = None) -> LossTerms:
     """
     All four terms.  `pred`/`target` are [N, 4, ny, nx] real channel form.
