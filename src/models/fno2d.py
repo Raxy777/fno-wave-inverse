@@ -35,6 +35,29 @@ normalisation would (§7.1).  Stability instead comes from the block being close
 the identity at initialisation: the spectral weights start at scale 1/(d_in d_out),
 so `v + act(W v + K v)` is a small perturbation of `v` in every block.
 
+**Domain padding, applied in `forward`.**  `rfft2` treats its input as one period of a
+periodic signal.  The scattered field here is not periodic: the absorber is cropped
+away, so the field is nonzero on all four edges, and the sources sit about 0.2 length
+units from the boundary.  Without padding, a wave leaving the right edge re-enters on
+the left through every spectral block, and the network has to spend capacity learning to
+cancel a wrap-around that the physics does not have.  The fix is the standard one:
+zero-pad the lifted features by `pad` cells on every side, run the blocks on the larger
+grid, and crop back before the projection.  The wrap-around distance becomes
+`2 * pad` cells instead of zero.
+
+Two consequences, both handled here rather than left to the caller:
+
+* A mode index is a physical wavenumber only for a fixed domain length.  Padding from
+  N to N + 2*pad cells lengthens the domain, so index k now means a *lower* physical
+  wavenumber, by a factor N / (N + 2*pad).  `padded_kmax` rescales the retained index
+  so the physical band is unchanged; `build(..., pad=p)` does it automatically.
+* `pad` is stored in cells of the reference grid (`cfg.N_NET`) and rescaled with the
+  resolution at call time, so the same weights at 2x resolution see the same physical
+  padding -- the discretisation-invariance claim of section 4.3 survives.
+
+`pad=0` is exactly the previous behaviour and adds no parameters, so old checkpoints
+load unchanged.
+
 **norm='ortho' on both transforms.**  Composed over a forward and an inverse, the
 overall scaling is 1/N^2 either way, so this is the same operator as the default
 convention -- but the intermediate spectral coefficients stay O(field) instead of
@@ -52,6 +75,20 @@ import torch.nn.functional as Fn
 from torch import Tensor
 
 from .. import config as cfg
+
+PAD_MODES = ("zeros", "replicate", "reflect")
+
+
+def padded_kmax(kmax: int, pad: int, n: int = cfg.N_NET) -> int:
+    """
+    Retained mode index on the padded grid that keeps the *physical* band of `kmax`
+    modes on the unpadded n-cell grid.
+
+    Index k on a grid of length n*dx is wavenumber 2 pi k / (n dx).  On n + 2*pad cells
+    the same wavenumber is index k * (n + 2*pad) / n, rounded up so the band is never
+    shrunk by the rounding.  pad = 0 returns kmax unchanged.
+    """
+    return int(math.ceil(kmax * (n + 2 * pad) / n))
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +226,14 @@ class FNO2d(nn.Module):
     def __init__(self, *, c_in: int = cfg.C_IN, c_out: int = cfg.C_OUT,
                  d_v: int = cfg.D_V, n_blocks: int = cfg.N_BLOCKS,
                  kmax: int = cfg.KMAX, lift_hidden: int = cfg.LIFT_HIDDEN,
-                 proj_hidden: int = cfg.PROJ_HIDDEN, radial: bool = True):
+                 proj_hidden: int = cfg.PROJ_HIDDEN, radial: bool = True,
+                 pad: int = 0, pad_mode: str = "zeros"):
         super().__init__()
+        assert pad >= 0, f"pad must be >= 0, got {pad}"
+        assert pad_mode in PAD_MODES, f"pad_mode {pad_mode!r} not in {PAD_MODES}"
         self.c_in, self.c_out, self.d_v, self.kmax = c_in, c_out, d_v, kmax
+        # cells of the reference grid (cfg.N_NET) added on each side; see forward()
+        self.pad, self.pad_mode = int(pad), pad_mode
         self.lift = nn.Sequential(
             nn.Conv2d(c_in, lift_hidden, 1), nn.GELU(),
             nn.Conv2d(lift_hidden, d_v, 1))
@@ -207,9 +249,27 @@ class FNO2d(nn.Module):
             f"got {x.shape[1]} input channels, expected {self.c_in}; "
             "build inputs with features.pack_inputs, not by hand")
         v = self.lift(x)
+        ny, nx = v.shape[-2], v.shape[-1]
+        py = int(round(self.pad * ny / cfg.N_NET))
+        px = int(round(self.pad * nx / cfg.N_NET))
+        if py or px:
+            v = self._pad(v, py, px)
         for b in self.blocks:
             v = b(v)
+        if py or px:
+            v = v[..., py:py + ny, px:px + nx]
         return self.project(v)
+
+    def _pad(self, v: Tensor, py: int, px: int) -> Tensor:
+        """
+        Pad the lifted features, not the raw input.  The raw input carries coordinate
+        and wavenumber channels that would be nonsense outside the domain (x_norm would
+        repeat, the SDF would be clipped); the lifted features are learned, so a zero
+        there is just "no information", which is what the region is.
+        """
+        if self.pad_mode == "zeros":
+            return Fn.pad(v, (px, px, py, py))
+        return Fn.pad(v, (px, px, py, py), mode=self.pad_mode)
 
     # -- reporting --------------------------------------------------------
     def effective_params(self) -> int:
@@ -227,7 +287,8 @@ class FNO2d(nn.Module):
         eff, alloc = self.effective_params(), self.allocated_params()
         want = cfg.total_params(self.d_v, self.kmax, len(self.blocks), radial=True)
         lines = [
-            f"FNO2d  d_v={self.d_v}  blocks={len(self.blocks)}  kmax={self.kmax}",
+            f"FNO2d  d_v={self.d_v}  blocks={len(self.blocks)}  kmax={self.kmax}"
+            + (f"  pad={self.pad} ({self.pad_mode})" if self.pad else ""),
             f"  effective parameters : {eff:,}",
             f"  allocated (incl. masked-off) : {alloc:,}",
             f"  config.total_params()        : {want:,}",
@@ -241,7 +302,11 @@ class FNO2d(nn.Module):
 def build(variant: str = "primary", **kw) -> FNO2d:
     """Instantiate one of the §6.4 capacity variants."""
     assert variant in cfg.VARIANTS, f"unknown variant {variant!r}"
-    return FNO2d(**{**cfg.VARIANTS[variant], **kw})
+    args = {**cfg.VARIANTS[variant], **kw}
+    if args.get("pad", 0) and "kmax" not in kw:
+        # keep the physical band: the variant's kmax is an index on the unpadded grid
+        args["kmax"] = padded_kmax(args["kmax"], args["pad"])
+    return FNO2d(**args)
 
 
 def to_double(model: nn.Module) -> nn.Module:
@@ -290,8 +355,8 @@ def band_in_modes(nu: float = min(cfg.NU_LIST),
     return k_s * cfg.L_DOMAIN / (2.0 * math.pi)
 
 
-__all__ = ["FNO2d", "FourierBlock", "SpectralConv2d", "band_in_modes", "build",
-           "to_double"]
+__all__ = ["FNO2d", "FourierBlock", "PAD_MODES", "SpectralConv2d", "band_in_modes",
+           "build", "padded_kmax", "to_double"]
 
 
 if __name__ == "__main__":
@@ -305,3 +370,6 @@ if __name__ == "__main__":
     print("forward:", tuple(net(x).shape))
     y = net(torch.randn(2, cfg.C_IN, 2 * cfg.N_NET, 2 * cfg.N_NET))
     print("forward at 2x resolution:", tuple(y.shape), "(same weights)")
+    padded = build("primary", pad=16)
+    print("\n" + padded.summary())
+    print("padded forward:", tuple(padded(x).shape))

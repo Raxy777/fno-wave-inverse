@@ -358,13 +358,16 @@ def save(model: FNO2d, path, *, epoch: int, val: EvalResult | None = None,
     determine the shape of every spectral weight, and loading a 'primary' checkpoint
     into a 'small' model raises a shape error, but loading a checkpoint trained with
     radial=False into radial=True does *not* -- the shapes match and the operator is
-    silently different.  Storing the arguments removes that failure mode.
+    silently different.  Storing the arguments removes that failure mode.  `pad` and
+    `pad_mode` are stored for the same reason -- and `load` defaults them to 0 / "zeros"
+    for checkpoints written before padding existed, which is what those models were.
     """
     torch.save(dict(
         state_dict=model.state_dict(),
         arch=dict(c_in=model.c_in, c_out=model.c_out, d_v=model.d_v,
                   n_blocks=len(model.blocks), kmax=model.kmax,
-                  radial=model.blocks[0].spectral.radial),
+                  radial=model.blocks[0].spectral.radial,
+                  pad=model.pad, pad_mode=model.pad_mode),
         epoch=epoch, alpha=alpha,
         val=None if val is None else dict(rel_l2=val.rel_l2,
                                           ring=val.ring_rel_l2,

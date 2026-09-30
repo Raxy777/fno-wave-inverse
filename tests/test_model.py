@@ -616,3 +616,94 @@ def test_baseline_and_pipeline_are_scored_by_one_function():
     # `to_unconstrained` would otherwise read the first three columns of.
     with pytest.raises(AssertionError, match="circle"):
         ell.z()
+
+
+# ---------------------------------------------------------------------------
+# Domain padding
+# ---------------------------------------------------------------------------
+def test_padded_kmax_keeps_the_physical_band():
+    """
+    Index k is wavenumber 2 pi k / (n dx).  Padding lengthens the domain, so the same
+    physical band needs a larger index -- and rounding must never shrink it.
+    """
+    from src.models.fno2d import padded_kmax
+    assert padded_kmax(28, 0) == 28
+    assert padded_kmax(28, 16) == 32           # 28 * 144 / 128 = 31.5 -> 32
+    assert padded_kmax(28, 32) == 42           # 28 * 192 / 128 = 42 exactly
+    for pad in (0, 4, 16, 32, 48):
+        k = padded_kmax(cfg.KMAX, pad)
+        assert k / (cfg.N_NET + 2 * pad) >= cfg.KMAX / cfg.N_NET
+
+
+def test_build_scales_kmax_with_pad_unless_told_otherwise():
+    assert build("primary").kmax == cfg.KMAX and build("primary").pad == 0
+    p = build("primary", pad=32)
+    assert p.pad == 32 and p.kmax == 42
+    assert build("primary", pad=32, kmax=30).kmax == 30      # explicit wins
+
+
+def test_padding_adds_no_parameters_and_pad_zero_is_the_old_operator():
+    a = FNO2d(d_v=8, kmax=4)
+    b = FNO2d(d_v=8, kmax=4, pad=16)
+    assert a.state_dict().keys() == b.state_dict().keys()
+    assert a.effective_params() == b.effective_params()
+    x = torch.randn(2, cfg.C_IN, 32, 32)
+    a0 = FNO2d(d_v=8, kmax=4, pad=0)
+    a0.load_state_dict(a.state_dict())
+    assert torch.equal(a(x), a0(x))
+
+
+@pytest.mark.parametrize("mode", ["zeros", "replicate", "reflect"])
+def test_padded_forward_preserves_shape_and_is_differentiable(mode):
+    net = FNO2d(d_v=8, kmax=6, pad=32, pad_mode=mode)        # 32 * 32/128 = 8 cells
+    x = torch.randn(2, cfg.C_IN, 32, 32, requires_grad=True)
+    y = net(x)
+    assert y.shape == (2, cfg.C_OUT, 32, 32)
+    y.pow(2).sum().backward()
+    assert torch.isfinite(x.grad).all() and x.grad.abs().sum() > 0
+
+
+def test_padding_actually_changes_the_output():
+    """Same weights, same kmax: if padding were a no-op the two outputs would agree."""
+    torch.manual_seed(0)
+    plain = FNO2d(d_v=8, kmax=4)
+    padded = FNO2d(d_v=8, kmax=4, pad=32)
+    padded.load_state_dict(plain.state_dict())
+    x = torch.randn(1, cfg.C_IN, 32, 32)
+    assert not torch.allclose(plain(x), padded(x), atol=1e-6)
+
+
+def test_pad_is_rescaled_with_resolution():
+    """pad is in reference-grid cells: 128 -> 16 per side, 256 -> 32, 64 -> 8."""
+    net = FNO2d(d_v=8, kmax=4, pad=16)
+    seen = []
+    orig = net._pad
+    net._pad = lambda v, py, px: (seen.append((py, px)), orig(v, py, px))[1]
+    for n, want in ((32, 4), (64, 8), (128, 16), (256, 32)):
+        net(torch.randn(1, cfg.C_IN, n, n))
+        assert seen[-1] == (want, want), (n, seen[-1])
+
+
+def test_unknown_pad_mode_and_negative_pad_are_rejected():
+    with pytest.raises(AssertionError, match="pad_mode"):
+        FNO2d(d_v=8, kmax=4, pad=4, pad_mode="circular")
+    with pytest.raises(AssertionError, match="pad must be"):
+        FNO2d(d_v=8, kmax=4, pad=-1)
+
+
+def test_pad_travels_with_the_checkpoint_and_old_checkpoints_still_load(tmp_path):
+    from src import training
+    net = FNO2d(d_v=8, kmax=6, pad=16, pad_mode="replicate")
+    training.save(net, tmp_path / "p.pt", epoch=3)
+    back, ck = training.load(tmp_path / "p.pt")
+    assert (back.pad, back.pad_mode, back.kmax) == (16, "replicate", 6)
+    assert ck["arch"]["pad"] == 16
+
+    # a checkpoint written before padding existed has no pad keys and must mean pad=0
+    old = FNO2d(d_v=8, kmax=6)
+    arch = dict(c_in=old.c_in, c_out=old.c_out, d_v=old.d_v, n_blocks=len(old.blocks),
+                kmax=old.kmax, radial=True)
+    torch.save(dict(state_dict=old.state_dict(), arch=arch, epoch=0, alpha=None,
+                    val=None), tmp_path / "old.pt")
+    legacy, _ = training.load(tmp_path / "old.pt")
+    assert (legacy.pad, legacy.pad_mode) == (0, "zeros")
